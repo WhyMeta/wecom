@@ -3,6 +3,7 @@
  * 处理 XML 格式回调
  */
 
+import { pathToFileURL } from "node:url";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk";
 import type { ResolvedAgentAccount } from "../types/index.js";
@@ -256,14 +257,25 @@ async function processAgentMessage(params: {
                 const ext = extMap[contentType] || "bin";
                 const filename = `${mediaId}.${ext}`;
 
+                // 使用 Core SDK 保存媒体文件
+                const saved = await core.channel.media.saveMediaBuffer(
+                    buffer,
+                    contentType,
+                    "inbound", // context/scope
+                    LIMITS.MAX_REQUEST_BODY_SIZE, // limit
+                    filename
+                );
+
+                log?.(`[wecom-agent] media saved to: ${saved.path}`);
+
                 // 构建附件
                 attachments.push({
                     name: filename,
                     mimeType: contentType,
-                    data: buffer.toString("base64"), // OpenClaw 通常接受 Base64
+                    url: pathToFileURL(saved.path).href, // 使用跨平台安全的文件 URL
                 });
 
-                // 更新文本提示，避免仅仅是 "[图片]"
+                // 更新文本提示
                 finalContent = `${content} (已下载 ${buffer.length} 字节)`;
             } catch (err) {
                 error?.(`[wecom-agent] media download failed: ${String(err)}`);

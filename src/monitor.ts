@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { pathToFileURL } from "node:url";
 
 import crypto from "node:crypto";
 
@@ -591,10 +592,17 @@ async function startAgentForStream(params: {
     })
     : undefined;
 
+  const attachments = mediaPath ? [{
+    name: media?.filename || "file",
+    mimeType: mediaType,
+    url: pathToFileURL(mediaPath).href
+  }] : undefined;
+
   const ctxPayload = core.channel.reply.finalizeInboundContext({
     Body: body,
     RawBody: rawBody,
     CommandBody: rawBody,
+    Attachments: attachments,
     From: chatType === "group" ? `wecom:group:${chatId}` : `wecom:${userid}`,
     To: `wecom:${chatId}`,
     SessionKey: route.sessionKey,
@@ -756,6 +764,38 @@ async function startAgentForStream(params: {
   });
 
   streamStore.markFinished(streamId);
+
+  // Bot 群聊图片兜底：
+  // 依赖企业微信的“流式消息刷新”回调来拉取最终消息有时会出现客户端未能及时拉取到最后一帧的情况，
+  // 导致最终的图片(msg_item)没有展示。若存在 response_url，则在流结束后主动推送一次最终 stream 回复。
+  // 注：该行为以 response_url 是否可用为准；失败则仅记录日志，不影响原有刷新链路。
+  if (chatType === "group") {
+    const state = streamStore.getStream(streamId);
+    const hasImages = Boolean(state?.images?.length);
+    const responseUrl = getActiveReplyUrl(streamId);
+    if (state && hasImages && responseUrl) {
+      const finalReply = buildStreamReplyFromState(state) as unknown as Record<string, unknown>;
+      try {
+        await useActiveReplyOnce(streamId, async ({ responseUrl, proxyUrl }) => {
+          const res = await wecomFetch(
+            responseUrl,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(finalReply),
+            },
+            { proxyUrl, timeoutMs: LIMITS.REQUEST_TIMEOUT_MS },
+          );
+          if (!res.ok) {
+            throw new Error(`final stream push failed: ${res.status}`);
+          }
+        });
+        logVerbose(target, `final stream pushed via response_url (group) streamId=${streamId}, images=${state.images?.length ?? 0}`);
+      } catch (err) {
+        target.runtime.error?.(`final stream push via response_url failed (group) streamId=${streamId}: ${String(err)}`);
+      }
+    }
+  }
 }
 
 function formatQuote(quote: WecomInboundQuote): string {
