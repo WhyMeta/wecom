@@ -118,10 +118,25 @@ export async function sendText(params: {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
     }, { proxyUrl: resolveWecomEgressProxyUrlFromNetwork(agent.network), timeoutMs: LIMITS.REQUEST_TIMEOUT_MS });
-    const json = await res.json() as { errcode?: number; errmsg?: string };
+    const json = await res.json() as {
+        errcode?: number;
+        errmsg?: string;
+        invaliduser?: string;
+        invalidparty?: string;
+        invalidtag?: string;
+    };
 
     if (json?.errcode !== 0) {
         throw new Error(`send failed: ${json?.errcode} ${json?.errmsg}`);
+    }
+
+    if (json?.invaliduser || json?.invalidparty || json?.invalidtag) {
+        const details = [
+            json.invaliduser ? `invaliduser=${json.invaliduser}` : "",
+            json.invalidparty ? `invalidparty=${json.invalidparty}` : "",
+            json.invalidtag ? `invalidtag=${json.invalidtag}` : ""
+        ].filter(Boolean).join(", ");
+        throw new Error(`send partial failure: ${details}`);
     }
 }
 
@@ -246,10 +261,25 @@ export async function sendMedia(params: {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
     }, { proxyUrl: resolveWecomEgressProxyUrlFromNetwork(agent.network), timeoutMs: LIMITS.REQUEST_TIMEOUT_MS });
-    const json = await res.json() as { errcode?: number; errmsg?: string };
+    const json = await res.json() as {
+        errcode?: number;
+        errmsg?: string;
+        invaliduser?: string;
+        invalidparty?: string;
+        invalidtag?: string;
+    };
 
     if (json?.errcode !== 0) {
         throw new Error(`send ${mediaType} failed: ${json?.errcode} ${json?.errmsg}`);
+    }
+
+    if (json?.invaliduser || json?.invalidparty || json?.invalidtag) {
+        const details = [
+            json.invaliduser ? `invaliduser=${json.invaliduser}` : "",
+            json.invalidparty ? `invalidparty=${json.invalidparty}` : "",
+            json.invalidtag ? `invalidtag=${json.invalidtag}` : ""
+        ].filter(Boolean).join(", ");
+        throw new Error(`send ${mediaType} partial failure: ${details}`);
     }
 }
 
@@ -263,7 +293,8 @@ export async function sendMedia(params: {
 export async function downloadMedia(params: {
     agent: ResolvedAgentAccount;
     mediaId: string;
-}): Promise<{ buffer: Buffer; contentType: string }> {
+    maxBytes?: number;
+}): Promise<{ buffer: Buffer; contentType: string; filename?: string }> {
     const { agent, mediaId } = params;
     const token = await getAccessToken(agent);
     const url = `${API_ENDPOINTS.DOWNLOAD_MEDIA}?access_token=${encodeURIComponent(token)}&media_id=${encodeURIComponent(mediaId)}`;
@@ -275,6 +306,24 @@ export async function downloadMedia(params: {
     }
 
     const contentType = res.headers.get("content-type") || "application/octet-stream";
+    const disposition = res.headers.get("content-disposition") || "";
+    const filename = (() => {
+        // 兼容：filename="a.md" / filename=a.md / filename*=UTF-8''a%2Eb.md
+        const mStar = disposition.match(/filename\*\s*=\s*([^;]+)/i);
+        if (mStar) {
+            const raw = mStar[1]!.trim().replace(/^"(.*)"$/, "$1");
+            const parts = raw.split("''");
+            const encoded = parts.length === 2 ? parts[1]! : raw;
+            try {
+                return decodeURIComponent(encoded);
+            } catch {
+                return encoded;
+            }
+        }
+        const m = disposition.match(/filename\s*=\s*([^;]+)/i);
+        if (!m) return undefined;
+        return m[1]!.trim().replace(/^"(.*)"$/, "$1") || undefined;
+    })();
 
     // 检查是否返回了错误 JSON
     if (contentType.includes("application/json")) {
@@ -282,6 +331,6 @@ export async function downloadMedia(params: {
         throw new Error(`download failed: ${json?.errcode} ${json?.errmsg}`);
     }
 
-    const buffer = await readResponseBodyAsBuffer(res);
-    return { buffer, contentType };
+    const buffer = await readResponseBodyAsBuffer(res, params.maxBytes);
+    return { buffer, contentType, filename };
 }

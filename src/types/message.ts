@@ -109,6 +109,8 @@ export type WecomAgentInboundMessage = {
     // 图片消息
     PicUrl?: string;
     MediaId?: string;
+    // 文件消息
+    FileName?: string;
     // 语音消息
     Format?: string;
     Recognition?: string;

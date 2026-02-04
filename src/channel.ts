@@ -31,7 +31,7 @@ const meta = {
 function normalizeWecomMessagingTarget(raw: string): string | undefined {
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
-  return trimmed.replace(/^(wecom|wechatwork|wework|qywx):/i, "").trim() || undefined;
+  return trimmed.replace(/^(wecom-agent|wecom|wechatwork|wework|qywx):/i, "").trim() || undefined;
 }
 
 type ResolvedWecomAccount = {

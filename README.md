@@ -44,23 +44,16 @@
 
 ---
 
-<div align="center">
-  <img src="https://cdn.jsdelivr.net/npm/@yanhaidao/wecom@latest/assets/01.image.jpg" width="45%" />
-  <img src="https://cdn.jsdelivr.net/npm/@yanhaidao/wecom@latest/assets/02.image.jpg" width="45%" />
-</div>
-
-
 
 ## 📊 模式能力对比
 
 | 能力维度 | 🤖 Bot 模式 | 🧩 Agent 模式 | ✨ **本插件 (双模)** |
-|:---|:---:|:---:|:---:|
-| **流式响应** | ✅ 原生支持 | ❌ 不支持 | **✅ 完美支持** |
-| **发送文件/图** | ❌ 不支持 | ✅ 支持 | **✅ 自动切换** |
-| **主动推送** | ❌ 仅回调 | ✅ 随时推送 | **✅ 完整 API** |
-| **Cronjob 定时** | ❌ 仅回调 | ✅ 支持 | **✅ 完美集成** |
-| **接收语音** | ✅ 转文字 | ✅ 语音+文字 | **✅ 双路处理** |
-| **群聊支持** | ✅ @即回 | ⚠️ 仅自建群 | **✅ 混合支持** |
+|:---|:---|:---|:---|
+| **接收消息 (单聊)** | ✅ 文本/图片/语音/文件 | ✅ 文本/图片/语音/视频/位置/链接 | **✅ 全能互补** (覆盖所有类型) |
+| **接收消息 (群聊)** | ✅ 文本/引用 | ❌ 不支持 (无回调) | **✅ 文本/引用** |
+| **发送消息** | ❌ 仅支持文本/图片/Markdown | ✅ **全格式支持** (文本/图片/视频/文件等) | **✅ 智能路由** (自动切换) |
+| **流式响应** | ✅ **支持** (打字机效果) | ❌ 不支持 | **✅ 完美支持** |
+| **主动推送** | ❌ 仅被动回复 | ✅ **支持** (指定用户/部门/标签) | **✅ 完整 API** |
 
 ---
 
@@ -89,8 +82,13 @@ openclaw config set channels.wecom.bot.receiveId ""
 openclaw config set channels.wecom.bot.streamPlaceholderContent "正在思考..."
 openclaw config set channels.wecom.bot.welcomeText "你好！我是 AI 助手"
 
-# 不配置表示所有人可用，配置则进入白名单模式
-openclaw config set channels.wecom.bot.dm.allowFrom '[]' 
+# DM 门禁（推荐显式设置 policy）
+# - open: 默认放开（所有人可用）
+# - disabled: 全部禁用
+# - allowlist: 仅 allowFrom 允许的人可用
+openclaw config set channels.wecom.bot.dm.policy "open"
+# policy=allowlist 时生效（例如只允许某些 userid；"*" 表示允许所有人）
+openclaw config set channels.wecom.bot.dm.allowFrom '["*"]'
 ```
 
 ### 3. 配置 Agent 模式（自建应用，可选）
@@ -103,8 +101,8 @@ openclaw config set channels.wecom.agent.agentId 1000001
 openclaw config set channels.wecom.agent.token "YOUR_CALLBACK_TOKEN"
 openclaw config set channels.wecom.agent.encodingAESKey "YOUR_CALLBACK_AES_KEY"
 openclaw config set channels.wecom.agent.welcomeText "欢迎使用智能助手"
-# 不配置表示所有人可用，配置则进入白名单模式
-openclaw config set channels.wecom.agent.dm.allowFrom '[]'
+openclaw config set channels.wecom.agent.dm.policy "open"
+openclaw config set channels.wecom.agent.dm.allowFrom '["*"]'
 ```
 
 ### 4. 高级网络配置 (公网出口代理)
@@ -317,8 +315,14 @@ Agent 输出 `{"template_card": ...}` 时自动渲染为交互卡片：
 **Q4: 群里 @机器人 发送文件失败？**
 > **A:** 因为企业微信 Bot 接口本身不支持发送非图片文件。我们的解决方案是：自动检测到文件发送需求后，改为通过 Agent 私信该用户发送文件，并在群里给出 "文件已私信发给您" 的提示。
 
-**Q5: Cronjob 定时任务怎么发给群？**
+**Q5: 为什么在 Agent 模式下发送文件（如 PDF、Word）给机器人没有反应？**
+> **A:** 这是由于企业微信官方接口限制。自建应用（Agent）的消息回调接口仅支持：文本、图片、语音、视频、位置和链接信息。**不支持**通用文件（File）类型的回调，因此插件无法感知您发送的文件。
+
+**Q6: Cronjob 定时任务怎么发给群？**
 > **A:** Cronjob 必须走 Agent 通道（Bot 无法主动发消息）。您只需在配置中指定 `to: "party:1"` (部门) 或 `to: "group:wr123..."` (外部群)，即可实现定时推送到群。
+
+**Q7: 为什么发视频给 Bot 没反应？**
+> **A:** 官方 Bot 接口**不支持接收视频**。如果您需要处理视频内容，请配置并使用 Agent 模式（Agent 支持接收视频）。
 
 ---
 
@@ -334,12 +338,18 @@ Agent 输出 `{"template_card": ...}` 时自动渲染为交互卡片：
 
 ## 更新日志
 
+### 2026.2.5
+
+- 🛠 **体验优化**：WeCom 媒体（图片/语音/视频/文件）处理的默认大小上限提升到 25MB，减少大文件因超限导致的“下载/保存失败”。
+- 📌 **可配置提示**：若仍遇到 Media exceeds ... limit，日志/回复会提示通过 channels.wecom.media.maxBytes 调整上限，并给出可直接执行的 openclaw config set 示例命令。
+
 ### 2026.2.4
 
 - 🚀 **架构升级**：实施 "Bot 优先 + Agent 兜底" 策略，兼顾流式体验与长任务稳定性（6分钟切换）。
-- ✨ **全模态支持**：Agent 模式完整支持接收与发送图片、文件、语音、视频。
+- ✨ **全模态支持**：Agent 模式完整支持接收图片/语音/视频（文件仅支持发送）。
 - ✨ **Cronjob 增强**：支持向部门 (`party:ID`) 和标签 (`tag:ID`) 广播消息。
 - 🛠 **Monitor 重构**：统一的消息防抖与流状态管理，提升并发稳定性。
+- 🛠 **体验优化**：修复企微重试导致的重复回复（Bot/Agent 均做 `msgid` 去重）；优化 Bot 连续多条消息的排队/合并回执，避免“重复同一答案”或“消息失败提示”。
 - 🐞 **修复**：Outbound ID 解析逻辑及 API 客户端参数缺失问题。
 
 ### 2026.2.3

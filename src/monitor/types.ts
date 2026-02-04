@@ -53,6 +53,10 @@ export type WecomWebhookTarget = {
 export type StreamState = {
     streamId: string;
     msgid?: string;
+    /** 会话键（同一人同一会话，用于队列/批次） */
+    conversationKey?: string;
+    /** 批次键（conversationKey + 批次序号） */
+    batchKey?: string;
     /** 触发者 userid（用于 Agent 私信兜底） */
     userId?: string;
     /** 会话类型（用于群聊兜底逻辑） */
@@ -97,6 +101,8 @@ export type StreamState = {
  */
 export type PendingInbound = {
     streamId: string;
+    conversationKey: string;
+    batchKey: string;
     target: WecomWebhookTarget;
     msg: WecomInboundMessage;
     contents: string[];
@@ -105,6 +111,8 @@ export type PendingInbound = {
     nonce: string;
     timestamp: string;
     timeout: ReturnType<typeof setTimeout> | null;
+    /** 已到达防抖截止时间，但因前序批次仍在处理中而暂存 */
+    readyToFlush?: boolean;
     createdAt: number;
 };
 

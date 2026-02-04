@@ -38,6 +38,35 @@ export const wecomOutbound: ChannelOutboundAdapter = {
       throw new Error("WeCom outbound requires a target (userid, partyid, tagid or chatid).");
     }
 
+    // 体验优化：/new /reset 的“New session started”回执在 OpenClaw 核心里是英文固定文案，
+    // 且通过 routeReply 走 wecom outbound（Agent 主动发送）。
+    // 在 WeCom“双模式”场景下，这会造成：
+    // - 用户在 Bot 会话发 /new，但却收到一条 Agent 私信回执（双重回复/错会话）。
+    // 因此：
+    // - Bot 会话目标：抑制该回执（Bot 会话里由 wecom 插件补中文回执）。
+    // - Agent 会话目标（wecom-agent:）：允许发送，但改写成中文。
+    let outgoingText = text;
+    const trimmed = String(outgoingText ?? "").trim();
+    const rawTo = typeof to === "string" ? to.trim().toLowerCase() : "";
+    const isAgentSessionTarget = rawTo.startsWith("wecom-agent:");
+    const looksLikeNewSessionAck =
+      /new session started/i.test(trimmed) && /model:/i.test(trimmed);
+
+    if (looksLikeNewSessionAck) {
+      if (!isAgentSessionTarget) {
+        console.log(`[wecom-outbound] Suppressed command ack to avoid Bot/Agent double-reply (len=${trimmed.length})`);
+        return { channel: "wecom", messageId: `suppressed-${Date.now()}`, timestamp: Date.now() };
+      }
+
+      const modelLabel = (() => {
+        const m = trimmed.match(/model:\s*([^\n()]+)\s*/i);
+        return m?.[1]?.trim();
+      })();
+      const rewritten = modelLabel ? `✅ 已开启新会话（模型：${modelLabel}）` : "✅ 已开启新会话。";
+      console.log(`[wecom-outbound] Rewrote command ack for agent session (len=${rewritten.length})`);
+      outgoingText = rewritten;
+    }
+
     const { touser, toparty, totag, chatid } = target;
     if (chatid) {
       throw new Error(
@@ -46,7 +75,7 @@ export const wecomOutbound: ChannelOutboundAdapter = {
           `请改为发送给用户（userid / user:xxx），或由 Bot 模式在群内交付。`,
       );
     }
-    console.log(`[wecom-outbound] Sending text to target=${JSON.stringify(target)} (len=${text.length})`);
+    console.log(`[wecom-outbound] Sending text to target=${JSON.stringify(target)} (len=${outgoingText.length})`);
 
     try {
       await sendAgentText({
@@ -55,7 +84,7 @@ export const wecomOutbound: ChannelOutboundAdapter = {
         toParty: toparty,
         toTag: totag,
         chatId: chatid,
-        text,
+        text: outgoingText,
       });
       console.log(`[wecom-outbound] Successfully sent text to ${JSON.stringify(target)}`);
     } catch (err) {

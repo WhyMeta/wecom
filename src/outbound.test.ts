@@ -97,4 +97,47 @@ describe("wecomOutbound", () => {
 
     now.mockRestore();
   });
+
+  it("suppresses /new ack for bot sessions but not agent sessions", async () => {
+    const { wecomOutbound } = await import("./outbound.js");
+    const api = await import("./agent/api-client.js");
+    const now = vi.spyOn(Date, "now").mockReturnValue(456);
+    (api.sendText as any).mockResolvedValue(undefined);
+    (api.sendText as any).mockClear();
+
+    const cfg = {
+      channels: {
+        wecom: {
+          enabled: true,
+          agent: {
+            corpId: "corp",
+            corpSecret: "secret",
+            agentId: 1000002,
+            token: "token",
+            encodingAESKey: "aes",
+          },
+        },
+      },
+    };
+
+    const ack = "✅ New session started · model: openai-codex/gpt-5.2";
+
+    // Bot 会话（wecom:...）应抑制，避免私信回执
+    const r1 = await wecomOutbound.sendText({ cfg, to: "wecom:userid123", text: ack } as any);
+    expect(api.sendText).not.toHaveBeenCalled();
+    expect(r1.messageId).toBe("suppressed-456");
+
+    (api.sendText as any).mockClear();
+
+    // Agent 会话（wecom-agent:...）允许发送回执
+    await wecomOutbound.sendText({ cfg, to: "wecom-agent:userid123", text: ack } as any);
+    expect(api.sendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        toUser: "userid123",
+        text: "✅ 已开启新会话（模型：openai-codex/gpt-5.2）",
+      }),
+    );
+
+    now.mockRestore();
+  });
 });

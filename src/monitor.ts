@@ -13,7 +13,7 @@ import { getWecomRuntime } from "./runtime.js";
 import { decryptWecomMedia, decryptWecomMediaWithHttp } from "./media.js";
 import { WEBHOOK_PATHS } from "./types/constants.js";
 import { handleAgentWebhook } from "./agent/index.js";
-import { resolveWecomAccounts, resolveWecomEgressProxyUrl } from "./config/index.js";
+import { resolveWecomAccounts, resolveWecomEgressProxyUrl, resolveWecomMediaMaxBytes } from "./config/index.js";
 import { wecomFetch } from "./http.js";
 import { sendText as sendAgentText, sendMedia as sendAgentMedia, uploadMedia } from "./agent/api-client.js";
 import axios from "axios";
@@ -27,6 +27,7 @@ import axios from "axios";
 
 import type { WecomRuntimeEnv, WecomWebhookTarget, StreamState, PendingInbound, ActiveReplyState } from "./monitor/types.js";
 import { monitorState, LIMITS } from "./monitor/state.js";
+import { buildWecomUnauthorizedCommandPrompt, resolveWecomCommandAuthorization } from "./shared/command-auth.js";
 
 // Global State
 monitorState.streamStore.setFlushHandler((pending) => void flushPending(pending));
@@ -228,6 +229,28 @@ function buildStreamPlaceholderReply(params: {
   };
 }
 
+function buildStreamImmediateTextReply(params: { streamId: string; content: string }): { msgtype: "stream"; stream: { id: string; finish: boolean; content: string } } {
+  return {
+    msgtype: "stream",
+    stream: {
+      id: params.streamId,
+      finish: true,
+      content: params.content.trim() || "1",
+    },
+  };
+}
+
+function buildStreamTextPlaceholderReply(params: { streamId: string; content: string }): { msgtype: "stream"; stream: { id: string; finish: boolean; content: string } } {
+  return {
+    msgtype: "stream",
+    stream: {
+      id: params.streamId,
+      finish: false,
+      content: params.content.trim() || "1",
+    },
+  };
+}
+
 function buildStreamReplyFromState(state: StreamState): { msgtype: "stream"; stream: { id: string; finish: boolean; content: string } } {
   const content = truncateUtf8Bytes(state.content, STREAM_MAX_BYTES);
   // Images handled? The original code had image logic.
@@ -276,6 +299,9 @@ function buildFallbackPrompt(params: {
   const scope = params.chatType === "group" ? "群聊" : params.chatType === "direct" ? "私聊" : "会话";
   if (!params.agentConfigured) {
     return `${scope}中需要通过应用私信发送${params.filename ? `（${params.filename}）` : ""}，但管理员尚未配置企业微信自建应用（Agent）通道。请联系管理员配置后再试。${who}`.trim();
+  }
+  if (!params.userId) {
+    return `${scope}中需要通过应用私信兜底发送${params.filename ? `（${params.filename}）` : ""}，但本次回调未能识别触发者 userid（请检查企微回调字段 from.userid / fromuserid）。请联系管理员排查配置。`.trim();
   }
   if (params.kind === "media") {
     return `已生成文件${params.filename ? `（${params.filename}）` : ""}，将通过应用私信发送给你。${who}`.trim();
@@ -449,23 +475,6 @@ async function useActiveReplyOnce(streamId: string, fn: (params: { responseUrl: 
 }
 
 
-function normalizeWecomAllowFromEntry(raw: string): string {
-  return raw
-    .trim()
-    .toLowerCase()
-    .replace(/^wecom:/, "")
-    .replace(/^user:/, "")
-    .replace(/^userid:/, "");
-}
-
-function isWecomSenderAllowed(senderUserId: string, allowFrom: string[]): boolean {
-  const list = allowFrom.map((entry) => normalizeWecomAllowFromEntry(entry)).filter(Boolean);
-  if (list.includes("*")) return true;
-  const normalizedSender = normalizeWecomAllowFromEntry(senderUserId);
-  if (!normalizedSender) return false;
-  return list.includes(normalizedSender);
-}
-
 function logVerbose(target: WecomWebhookTarget, message: string): void {
   const should =
     target.core.logging?.shouldLogVerbose?.() ??
@@ -523,8 +532,7 @@ type InboundResult = {
 async function processInboundMessage(target: WecomWebhookTarget, msg: WecomInboundMessage): Promise<InboundResult> {
   const msgtype = String(msg.msgtype ?? "").toLowerCase();
   const aesKey = target.account.encodingAESKey;
-  const mediaMaxMb = 5; // Default 5MB
-  const maxBytes = mediaMaxMb * 1024 * 1024;
+  const maxBytes = resolveWecomMediaMaxBytes(target.config);
   const proxyUrl = resolveWecomEgressProxyUrl(target.config);
 
   // 图片消息处理：如果存在 url 且配置了 aesKey，则尝试解密下载
@@ -543,7 +551,9 @@ async function processInboundMessage(target: WecomWebhookTarget, msg: WecomInbou
         };
       } catch (err) {
         target.runtime.error?.(`Failed to decrypt inbound image: ${String(err)}`);
-        target.runtime.error?.(`图片解密失败: ${String(err)}`);
+        target.runtime.error?.(
+          `图片解密失败: ${String(err)}; 可调大 channels.wecom.media.maxBytes（当前=${maxBytes}）例如：openclaw config set channels.wecom.media.maxBytes ${50 * 1024 * 1024}`,
+        );
         return { body: `[image] (decryption failed: ${typeof err === 'object' && err ? (err as any).message : String(err)})` };
       }
     }
@@ -563,7 +573,9 @@ async function processInboundMessage(target: WecomWebhookTarget, msg: WecomInbou
           }
         };
       } catch (err) {
-        target.runtime.error?.(`Failed to decrypt inbound file: ${String(err)}`);
+        target.runtime.error?.(
+          `Failed to decrypt inbound file: ${String(err)}; 可调大 channels.wecom.media.maxBytes（当前=${maxBytes}）例如：openclaw config set channels.wecom.media.maxBytes ${50 * 1024 * 1024}`,
+        );
         return { body: `[file] (decryption failed: ${typeof err === 'object' && err ? (err as any).message : String(err)})` };
       }
     }
@@ -594,7 +606,9 @@ async function processInboundMessage(target: WecomWebhookTarget, msg: WecomInbou
               };
               bodyParts.push(`[${t}]`);
             } catch (err) {
-              target.runtime.error?.(`Failed to decrypt mixed ${t}: ${String(err)}`);
+              target.runtime.error?.(
+                `Failed to decrypt mixed ${t}: ${String(err)}; 可调大 channels.wecom.media.maxBytes（当前=${maxBytes}）例如：openclaw config set channels.wecom.media.maxBytes ${50 * 1024 * 1024}`,
+              );
               bodyParts.push(`[${t}] (decryption failed)`);
             }
           } else {
@@ -632,7 +646,7 @@ async function processInboundMessage(target: WecomWebhookTarget, msg: WecomInbou
  * 5. 处理异常并更新 Stream 状态为 Error。
  */
 async function flushPending(pending: PendingInbound): Promise<void> {
-  const { streamId, target, msg, contents, msgids } = pending;
+  const { streamId, target, msg, contents, msgids, conversationKey, batchKey } = pending;
 
   // Merge all message contents (each is already formatted by buildInboundBody)
   const mergedContents = contents.filter(c => c.trim()).join("\n").trim();
@@ -643,13 +657,15 @@ async function flushPending(pending: PendingInbound): Promise<void> {
   } catch (err) {
     logVerbose(target, `flush pending: runtime not ready: ${String(err)}`);
     streamStore.markFinished(streamId);
+    logInfo(target, `queue: runtime not ready，结束批次并推进 streamId=${streamId}`);
+    streamStore.onStreamFinished(streamId);
     return;
   }
 
   if (core) {
     streamStore.markStarted(streamId);
     const enrichedTarget: WecomWebhookTarget = { ...target, core };
-    logVerbose(target, `flush pending: starting agent for ${contents.length} merged messages`);
+    logInfo(target, `flush pending: start batch streamId=${streamId} batchKey=${batchKey} conversationKey=${conversationKey} mergedCount=${contents.length}`);
     logVerbose(target, `防抖结束: 开始处理聚合消息 数量=${contents.length} streamId=${streamId}`);
 
     // Pass the first msg (with its media structure), and mergedContents for multi-message context
@@ -667,6 +683,7 @@ async function flushPending(pending: PendingInbound): Promise<void> {
         state.finished = true;
       });
       target.runtime.error?.(`[${target.account.accountId}] wecom agent failed (处理失败): ${String(err)}`);
+      streamStore.onStreamFinished(streamId);
     });
   }
 }
@@ -814,6 +831,8 @@ async function startAgentForStream(params: {
         } else {
           logVerbose(target, `local-path: 无 response_url，等待 stream_refresh 拉取最终图片`);
         }
+        // 该消息已完成，推进队列处理下一批
+        streamStore.onStreamFinished(streamId);
         return;
       }
     }
@@ -846,9 +865,13 @@ async function startAgentForStream(params: {
         target.runtime.error?.(`local-path: 文件兜底提示推送失败: ${String(err)}`);
       }
 
-      if (!agentCfg) return;
+      if (!agentCfg) {
+        streamStore.onStreamFinished(streamId);
+        return;
+      }
       if (!userid || userid === "unknown") {
         target.runtime.error?.(`local-path: 无法识别触发者 userId，无法 Agent 私信发送文件`);
+        streamStore.onStreamFinished(streamId);
         return;
       }
 
@@ -871,6 +894,7 @@ async function startAgentForStream(params: {
           target.runtime.error?.(`local-path: Agent 私信发送文件失败 path=${p}: ${String(err)}`);
         }
       }
+      streamStore.onStreamFinished(streamId);
       return;
     }
   }
@@ -880,7 +904,7 @@ async function startAgentForStream(params: {
   let mediaType: string | undefined;
   if (media) {
     try {
-      const maxBytes = 5 * 1024 * 1024;
+      const maxBytes = resolveWecomMediaMaxBytes(target.config);
       const saved = await core.channel.media.saveMediaBuffer(
         media.buffer,
         media.contentType,
@@ -923,26 +947,39 @@ async function startAgentForStream(params: {
     body: rawBody,
   });
 
-  const dmPolicy = account.config.dm?.policy ?? "pairing";
-  const configAllowFrom = (account.config.dm?.allowFrom ?? []).map((v) => String(v));
-  const shouldComputeAuth = core.channel.commands.shouldComputeCommandAuthorized(rawBody, config);
-  const storeAllowFrom =
-    dmPolicy !== "open" || shouldComputeAuth
-      ? await core.channel.pairing.readAllowFromStore("wecom").catch(() => [])
-      : [];
-  const effectiveAllowFrom = [...configAllowFrom, ...storeAllowFrom];
-  const useAccessGroups = config.commands?.useAccessGroups !== false;
-  const senderAllowed = isWecomSenderAllowed(userid, effectiveAllowFrom);
-  const allowAllConfigured = effectiveAllowFrom.some((entry) => normalizeWecomAllowFromEntry(entry) === "*");
-  const authorizerConfigured = allowAllConfigured || effectiveAllowFrom.length > 0;
-  const commandAuthorized = shouldComputeAuth
-    ? core.channel.commands.resolveCommandAuthorizedFromAuthorizers({
-      useAccessGroups,
-      authorizers: [{ configured: authorizerConfigured, allowed: senderAllowed }],
-      // When access groups are enabled, authorizers must be configured; if the
-      // allowlist is empty, keep commands gated off by default.
-    })
-    : undefined;
+  const authz = await resolveWecomCommandAuthorization({
+    core,
+    cfg: config,
+    accountConfig: account.config,
+    rawBody,
+    senderUserId: userid,
+  });
+  const commandAuthorized = authz.commandAuthorized;
+  logVerbose(
+    target,
+    `authz: dmPolicy=${authz.dmPolicy} shouldCompute=${authz.shouldComputeAuth} sender=${userid.toLowerCase()} senderAllowed=${authz.senderAllowed} authorizerConfigured=${authz.authorizerConfigured} commandAuthorized=${String(authz.commandAuthorized)}`,
+  );
+
+  // 命令门禁：如果这是命令且未授权，必须给用户一个明确的中文回复（不能静默忽略）
+  if (authz.shouldComputeAuth && authz.commandAuthorized !== true) {
+    const prompt = buildWecomUnauthorizedCommandPrompt({ senderUserId: userid, dmPolicy: authz.dmPolicy, scope: "bot" });
+    streamStore.updateStream(streamId, (s) => {
+      s.finished = true;
+      s.content = prompt;
+    });
+    try {
+      await sendBotFallbackPromptNow({ streamId, text: prompt });
+      logInfo(target, `authz: 未授权命令已提示用户 streamId=${streamId}`);
+    } catch (err) {
+      target.runtime.error?.(`authz: 未授权命令提示推送失败 streamId=${streamId}: ${String(err)}`);
+    }
+    streamStore.onStreamFinished(streamId);
+    return;
+  }
+
+  const rawBodyNormalized = rawBody.trim();
+  const isResetCommand = /^\/(new|reset)(?:\s|$)/i.test(rawBodyNormalized);
+  const resetCommandKind = isResetCommand ? (rawBodyNormalized.match(/^\/(new|reset)/i)?.[1]?.toLowerCase() ?? "new") : null;
 
   const attachments = mediaPath ? [{
     name: media?.filename || "file",
@@ -997,17 +1034,25 @@ async function startAgentForStream(params: {
   // 否则 Agent 可能直接通过 message 工具私信/发群，绕过 Bot 交付链路，导致群里“没有任何提示”。
   const cfgForDispatch = (() => {
     const baseTools = (config as any)?.tools ?? {};
-    const existingDeny = Array.isArray(baseTools.deny) ? (baseTools.deny as string[]) : [];
+    const baseSandbox = (baseTools as any)?.sandbox ?? {};
+    const baseSandboxTools = (baseSandbox as any)?.tools ?? {};
+    const existingDeny = Array.isArray((baseSandboxTools as any).deny) ? ((baseSandboxTools as any).deny as string[]) : [];
     const deny = Array.from(new Set([...existingDeny, "message"]));
     return {
       ...(config as any),
       tools: {
         ...baseTools,
-        deny,
+        sandbox: {
+          ...baseSandbox,
+          tools: {
+            ...baseSandboxTools,
+            deny,
+          },
+        },
       },
     } as OpenClawConfig;
   })();
-  logVerbose(target, `tool-policy: WeCom Bot 会话已禁用 message 工具（防止绕过 Bot 交付）`);
+  logVerbose(target, `tool-policy: WeCom Bot 会话已禁用 message 工具（tools.sandbox.tools.deny += message，防止绕过 Bot 交付）`);
 
   // 调度 Agent 回复
   // 使用 dispatchReplyWithBufferedBlockDispatcher 可以处理流式输出 buffer
@@ -1272,6 +1317,21 @@ async function startAgentForStream(params: {
     },
   });
 
+  // /new /reset：OpenClaw 核心会通过 routeReply 发送英文回执（✅ New session started...），
+  // 但 WeCom 双模式下这条回执可能会走 Agent 私信，导致“从 Bot 发，却在 Agent 再回一条”。
+  // 该英文回执已在 wecom outbound 层做抑制/改写；这里补一个“同会话中文回执”，保证用户可理解。
+  if (isResetCommand) {
+    const current = streamStore.getStream(streamId);
+    const hasAnyContent = Boolean(current?.content?.trim());
+    if (current && !hasAnyContent) {
+      const ackText = resetCommandKind === "reset" ? "✅ 已重置会话。" : "✅ 已开启新会话。";
+      streamStore.updateStream(streamId, (s) => {
+        s.content = ackText;
+        s.finished = true;
+      });
+    }
+  }
+
   streamStore.markFinished(streamId);
 
   // Timeout fallback final delivery (Agent DM): send once after the agent run completes.
@@ -1327,6 +1387,25 @@ async function startAgentForStream(params: {
       }
     }
   }
+
+  // 推进会话队列：如果 2/3 已排队，当前批次结束后自动开始下一批次
+  logInfo(target, `queue: 当前批次结束，尝试推进下一批 streamId=${streamId}`);
+
+  // 体验优化：如果本批次中有“回执流”(ack stream)（例如 3 被合并到 2），则在批次结束时更新这些回执流，
+  // 避免它们永久停留在“已合并排队处理中…”。
+  const ackStreamIds = streamStore.drainAckStreamsForBatch(streamId);
+  if (ackStreamIds.length > 0) {
+    const mergedDoneHint = "✅ 已合并处理完成，请查看上一条回复。";
+    for (const ackId of ackStreamIds) {
+      streamStore.updateStream(ackId, (s) => {
+        s.content = mergedDoneHint;
+        s.finished = true;
+      });
+    }
+    logInfo(target, `queue: 已更新回执流 count=${ackStreamIds.length} batchStreamId=${streamId}`);
+  }
+
+  streamStore.onStreamFinished(streamId);
 }
 
 function formatQuote(quote: WecomInboundQuote): string {
@@ -1424,12 +1503,34 @@ export function registerAgentWebhookTarget(target: AgentWebhookTarget): () => vo
  */
 export async function handleWecomWebhookRequest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
   const path = resolvePath(req);
+  const reqId = crypto.randomUUID().slice(0, 8);
+  const remote = req.socket?.remoteAddress ?? "unknown";
+  const ua = String(req.headers["user-agent"] ?? "");
+  const cl = String(req.headers["content-length"] ?? "");
+  // 不输出敏感参数内容，仅输出是否存在（排查“有没有打到网关/有没有带签名参数”）
+  const q = resolveQueryParams(req);
+  const hasTimestamp = Boolean(q.get("timestamp"));
+  const hasNonce = Boolean(q.get("nonce"));
+  const hasEchostr = Boolean(q.get("echostr"));
+  const hasMsgSig = Boolean(q.get("msg_signature"));
+  const hasSignature = Boolean(q.get("signature"));
+  console.log(
+    `[wecom] inbound(http): reqId=${reqId} path=${path} method=${req.method ?? "UNKNOWN"} remote=${remote} ua=${ua ? `"${ua}"` : "N/A"} contentLength=${cl || "N/A"} query={timestamp:${hasTimestamp},nonce:${hasNonce},echostr:${hasEchostr},msg_signature:${hasMsgSig},signature:${hasSignature}}`,
+  );
 
   // Agent 模式路由: /wecom/agent
   if (path === WEBHOOK_PATHS.AGENT) {
     const agentTarget = agentTargets.get(WEBHOOK_PATHS.AGENT);
     if (agentTarget) {
       const core = getWecomRuntime();
+      const query = resolveQueryParams(req);
+      const timestamp = query.get("timestamp") ?? "";
+      const nonce = query.get("nonce") ?? "";
+      const hasSig = Boolean(query.get("msg_signature"));
+      const remote = req.socket?.remoteAddress ?? "unknown";
+      agentTarget.runtime.log?.(
+        `[wecom] inbound(agent): reqId=${reqId} method=${req.method ?? "UNKNOWN"} remote=${remote} timestamp=${timestamp ? "yes" : "no"} nonce=${nonce ? "yes" : "no"} msg_signature=${hasSig ? "yes" : "no"}`,
+      );
       return handleAgentWebhook({
         req,
         res,
@@ -1489,6 +1590,10 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
   }
   const record = body.value as any;
   const encrypt = String(record?.encrypt ?? record?.Encrypt ?? "");
+  // Bot POST 回调体积/字段诊断（不输出 encrypt 内容）
+  console.log(
+    `[wecom] inbound(bot): reqId=${reqId} rawJsonBytes=${Buffer.byteLength(JSON.stringify(record), "utf8")} hasEncrypt=${Boolean(encrypt)} encryptLen=${encrypt.length}`,
+  );
   const target = targets.find(c => c.account.token && verifyWecomSignature({ token: c.account.token, timestamp, nonce, encrypt, signature }));
   if (!target || !target.account.configured || !target.account.encodingAESKey) {
     res.statusCode = 401;
@@ -1496,6 +1601,9 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
     res.end(`unauthorized - Bot 签名验证失败${ERROR_HELP}`);
     return true;
   }
+
+  // 选定 target 后，把 reqId 带入结构化日志，方便串联排查
+  logInfo(target, `inbound(bot): reqId=${reqId} selectedAccount=${target.account.accountId} path=${path}`);
 
   let plain: string;
   try {
@@ -1571,7 +1679,7 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
   try {
     const userid = resolveWecomSenderUserId(msg) || "unknown";
     const chatId = msg.chattype === "group" ? (msg.chatid?.trim() || "unknown") : userid;
-    const pendingKey = `wecom:${target.account.accountId}:${userid}:${chatId}`;
+    const conversationKey = `wecom:${target.account.accountId}:${userid}:${chatId}`;
     const msgContent = buildInboundBody(msg);
 
     logInfo(
@@ -1599,8 +1707,8 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
 
     // 加入 Pending 队列 (防抖/聚合)
     // 消息不会立即处理，而是等待防抖计时器结束（flushPending）后统一触发
-    const { streamId, isNew } = streamStore.addPendingMessage({
-      pendingKey,
+    const { streamId, status } = streamStore.addPendingMessage({
+      conversationKey,
       target,
       msg,
       msgContent,
@@ -1609,16 +1717,56 @@ export async function handleWecomWebhookRequest(req: IncomingMessage, res: Serve
       debounceMs: (target.account.config as any).debounceMs
     });
 
-    if (isNew) {
+    // 无论是否新建，都尽量保存 response_url（用于兜底提示/最终帧推送）
+    if (msg.response_url) {
       storeActiveReply(streamId, msg.response_url, proxyUrl);
     }
 
+    const defaultPlaceholder = target.account.config.streamPlaceholderContent;
+    const queuedPlaceholder = "已收到，已排队处理中...";
+    const mergedQueuedPlaceholder = "已收到，已合并排队处理中...";
+
+    if (status === "active_new") {
+      jsonOk(res, buildEncryptedJsonReply({
+        account: target.account,
+        plaintextJson: buildStreamPlaceholderReply({
+          streamId,
+          placeholderContent: defaultPlaceholder
+        }),
+        nonce,
+        timestamp
+      }));
+      return true;
+    }
+
+    if (status === "queued_new") {
+      logInfo(target, `queue: 已进入下一批次 streamId=${streamId} msgid=${String(msg.msgid ?? "")}`);
+      jsonOk(res, buildEncryptedJsonReply({
+        account: target.account,
+        plaintextJson: buildStreamPlaceholderReply({
+          streamId,
+          placeholderContent: queuedPlaceholder
+        }),
+        nonce,
+        timestamp
+      }));
+      return true;
+    }
+
+    // active_merged / queued_merged：合并进某个批次，但本条消息不应该刷出“完整答案”，否则用户会看到重复内容。
+    // 做法：为本条 msgid 创建一个“回执 stream”，先显示“已合并排队”，并在批次结束时自动更新为“已合并处理完成”。
+    const ackStreamId = streamStore.createStream({ msgid: String(msg.msgid ?? "") || undefined });
+    streamStore.updateStream(ackStreamId, (s) => {
+      s.finished = false;
+      s.started = true;
+      s.content = mergedQueuedPlaceholder;
+    });
+    if (msg.msgid) streamStore.setStreamIdForMsgId(String(msg.msgid), ackStreamId);
+    streamStore.addAckStreamForBatch({ batchStreamId: streamId, ackStreamId });
+    logInfo(target, `queue: 已合并排队（回执流） ackStreamId=${ackStreamId} mergedIntoStreamId=${streamId} msgid=${String(msg.msgid ?? "")}`);
     jsonOk(res, buildEncryptedJsonReply({
       account: target.account,
-      plaintextJson: buildStreamPlaceholderReply({
-        streamId,
-        placeholderContent: target.account.config.streamPlaceholderContent
-      }),
+      plaintextJson: buildStreamTextPlaceholderReply({ streamId: ackStreamId, content: mergedQueuedPlaceholder }),
       nonce,
       timestamp
     }));

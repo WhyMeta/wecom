@@ -4,19 +4,84 @@
  */
 
 import { pathToFileURL } from "node:url";
+import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { OpenClawConfig, PluginRuntime } from "openclaw/plugin-sdk";
 import type { ResolvedAgentAccount } from "../types/index.js";
 import { LIMITS } from "../types/constants.js";
 import { decryptWecomEncrypted, verifyWecomSignature, computeWecomMsgSignature, encryptWecomPlaintext } from "../crypto/index.js";
 import { extractEncryptFromXml, buildEncryptedXmlResponse } from "../crypto/xml.js";
-import { parseXml, extractMsgType, extractFromUser, extractContent, extractChatId, extractMediaId } from "../shared/xml-parser.js";
+import { parseXml, extractMsgType, extractFromUser, extractContent, extractChatId, extractMediaId, extractMsgId, extractFileName } from "../shared/xml-parser.js";
 import { sendText, downloadMedia } from "./api-client.js";
 import { getWecomRuntime } from "../runtime.js";
 import type { WecomAgentInboundMessage } from "../types/index.js";
+import { buildWecomUnauthorizedCommandPrompt, resolveWecomCommandAuthorization } from "../shared/command-auth.js";
+import { resolveWecomMediaMaxBytes } from "../config/index.js";
 
 /** 错误提示信息 */
 const ERROR_HELP = "\n\n遇到问题？联系作者: YanHaidao (微信: YanHaidao)";
+
+// Agent webhook 幂等去重池（防止企微回调重试导致重复回复）
+// 注意：这是进程内内存去重，重启会清空；但足以覆盖企微的短周期重试。
+const RECENT_MSGID_TTL_MS = 10 * 60 * 1000;
+const recentAgentMsgIds = new Map<string, number>();
+
+function rememberAgentMsgId(msgId: string): boolean {
+    const now = Date.now();
+    const existing = recentAgentMsgIds.get(msgId);
+    if (existing && now - existing < RECENT_MSGID_TTL_MS) return false;
+    recentAgentMsgIds.set(msgId, now);
+    // 简单清理：只在写入时做一次线性 prune，避免无界增长
+    for (const [k, ts] of recentAgentMsgIds) {
+        if (now - ts >= RECENT_MSGID_TTL_MS) recentAgentMsgIds.delete(k);
+    }
+    return true;
+}
+
+function looksLikeTextFile(buffer: Buffer): boolean {
+    const sampleSize = Math.min(buffer.length, 4096);
+    if (sampleSize === 0) return true;
+    let bad = 0;
+    for (let i = 0; i < sampleSize; i++) {
+        const b = buffer[i]!;
+        const isWhitespace = b === 0x09 || b === 0x0a || b === 0x0d; // \t \n \r
+        const isPrintable = b >= 0x20 && b !== 0x7f;
+        if (!isWhitespace && !isPrintable) bad++;
+    }
+    // 非可打印字符占比太高，基本可判断为二进制
+    return bad / sampleSize <= 0.02;
+}
+
+function analyzeTextHeuristic(buffer: Buffer): { sampleSize: number; badCount: number; badRatio: number } {
+    const sampleSize = Math.min(buffer.length, 4096);
+    if (sampleSize === 0) return { sampleSize: 0, badCount: 0, badRatio: 0 };
+    let badCount = 0;
+    for (let i = 0; i < sampleSize; i++) {
+        const b = buffer[i]!;
+        const isWhitespace = b === 0x09 || b === 0x0a || b === 0x0d;
+        const isPrintable = b >= 0x20 && b !== 0x7f;
+        if (!isWhitespace && !isPrintable) badCount++;
+    }
+    return { sampleSize, badCount, badRatio: badCount / sampleSize };
+}
+
+function previewHex(buffer: Buffer, maxBytes = 32): string {
+    const n = Math.min(buffer.length, maxBytes);
+    if (n <= 0) return "";
+    return buffer
+        .subarray(0, n)
+        .toString("hex")
+        .replace(/(..)/g, "$1 ")
+        .trim();
+}
+
+function buildTextFilePreview(buffer: Buffer, maxChars: number): string | undefined {
+    if (!looksLikeTextFile(buffer)) return undefined;
+    const text = buffer.toString("utf8");
+    if (!text.trim()) return undefined;
+    const truncated = text.length > maxChars ? `${text.slice(0, maxChars)}\n…(已截断)` : text;
+    return truncated;
+}
 
 /**
  * **AgentWebhookParams (Webhook 处理器参数)**
@@ -98,6 +163,13 @@ async function handleUrlVerification(
     const nonce = query.get("nonce") ?? "";
     const echostr = query.get("echostr") ?? "";
     const signature = query.get("msg_signature") ?? "";
+    const remote = req.socket?.remoteAddress ?? "unknown";
+
+    // 不输出敏感参数内容，仅输出存在性
+    // 用于排查：是否有请求打到 /wecom/agent
+    // 以及是否带齐 timestamp/nonce/msg_signature/echostr
+    // eslint-disable-next-line no-unused-vars
+    const _debug = { remote, hasTimestamp: Boolean(timestamp), hasNonce: Boolean(nonce), hasSig: Boolean(signature), hasEchostr: Boolean(echostr) };
 
     const valid = verifyWecomSignature({
         token: agent.token,
@@ -139,13 +211,19 @@ async function handleMessageCallback(params: AgentWebhookParams): Promise<boolea
     const { req, res, agent, config, core, log, error } = params;
 
     try {
+        log?.(`[wecom-agent] inbound: method=${req.method ?? "UNKNOWN"} remote=${req.socket?.remoteAddress ?? "unknown"}`);
         const rawXml = await readRawBody(req);
+        log?.(`[wecom-agent] inbound: rawXmlBytes=${Buffer.byteLength(rawXml, "utf8")}`);
         const encrypted = extractEncryptFromXml(rawXml);
+        log?.(`[wecom-agent] inbound: hasEncrypt=${Boolean(encrypted)} encryptLen=${encrypted ? String(encrypted).length : 0}`);
 
         const query = resolveQueryParams(req);
         const timestamp = query.get("timestamp") ?? "";
         const nonce = query.get("nonce") ?? "";
         const signature = query.get("msg_signature") ?? "";
+        log?.(
+            `[wecom-agent] inbound: query timestamp=${timestamp ? "yes" : "no"} nonce=${nonce ? "yes" : "no"} msg_signature=${signature ? "yes" : "no"}`,
+        );
 
         // 验证签名
         const valid = verifyWecomSignature({
@@ -157,6 +235,7 @@ async function handleMessageCallback(params: AgentWebhookParams): Promise<boolea
         });
 
         if (!valid) {
+            error?.(`[wecom-agent] inbound: signature invalid`);
             res.statusCode = 401;
             res.setHeader("Content-Type", "text/plain; charset=utf-8");
             res.end(`unauthorized - 签名验证失败${ERROR_HELP}`);
@@ -169,15 +248,28 @@ async function handleMessageCallback(params: AgentWebhookParams): Promise<boolea
             receiveId: agent.corpId,
             encrypt: encrypted,
         });
+        log?.(`[wecom-agent] inbound: decryptedBytes=${Buffer.byteLength(decrypted, "utf8")}`);
 
         // 解析 XML
         const msg = parseXml(decrypted);
         const msgType = extractMsgType(msg);
         const fromUser = extractFromUser(msg);
         const chatId = extractChatId(msg);
-        const content = extractContent(msg);
+        const msgId = extractMsgId(msg);
+        if (msgId) {
+            const ok = rememberAgentMsgId(msgId);
+            if (!ok) {
+                log?.(`[wecom-agent] duplicate msgId=${msgId} from=${fromUser} chatId=${chatId ?? "N/A"} type=${msgType}; skipped`);
+                res.statusCode = 200;
+                res.setHeader("Content-Type", "text/plain; charset=utf-8");
+                res.end("success");
+                return true;
+            }
+        }
+        const content = String(extractContent(msg) ?? "");
 
-        log?.(`[wecom-agent] ${msgType} from=${fromUser} chatId=${chatId ?? "N/A"} content=${content.slice(0, 100)}`);
+        const preview = content.length > 100 ? `${content.slice(0, 100)}…` : content;
+        log?.(`[wecom-agent] ${msgType} from=${fromUser} chatId=${chatId ?? "N/A"} msgId=${msgId ?? "N/A"} content=${preview}`);
 
         // 先返回 success (Agent 模式使用 API 发送回复，不用被动回复)
         res.statusCode = 200;
@@ -237,6 +329,7 @@ async function processAgentMessage(params: {
 
     const isGroup = Boolean(chatId);
     const peerId = isGroup ? chatId! : fromUser;
+    const mediaMaxBytes = resolveWecomMediaMaxBytes(config);
 
     // 处理媒体文件
     const attachments: any[] = []; // TODO: define specific type
@@ -249,44 +342,95 @@ async function processAgentMessage(params: {
         if (mediaId) {
             try {
                 log?.(`[wecom-agent] downloading media: ${mediaId} (${msgType})`);
-                const { buffer, contentType } = await downloadMedia({ agent, mediaId });
+                const { buffer, contentType, filename: headerFileName } = await downloadMedia({ agent, mediaId, maxBytes: mediaMaxBytes });
+                const xmlFileName = extractFileName(msg);
+                const originalFileName = (xmlFileName || headerFileName || `${mediaId}.bin`).trim();
+                const heuristic = analyzeTextHeuristic(buffer);
 
                 // 推断文件名后缀
                 const extMap: Record<string, string> = {
                     "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif",
                     "audio/amr": "amr", "audio/speex": "speex", "video/mp4": "mp4",
                 };
-                const ext = extMap[contentType] || "bin";
+                const textPreview = msgType === "file" ? buildTextFilePreview(buffer, 12_000) : undefined;
+                const looksText = Boolean(textPreview);
+                const originalExt = path.extname(originalFileName).toLowerCase();
+                const normalizedContentType =
+                    looksText && originalExt === ".md" ? "text/markdown" :
+                    looksText && (!contentType || contentType === "application/octet-stream")
+                        ? "text/plain; charset=utf-8"
+                        : contentType;
+
+                const ext = extMap[normalizedContentType] || (looksText ? "txt" : "bin");
                 const filename = `${mediaId}.${ext}`;
+
+                log?.(
+                    `[wecom-agent] file meta: msgType=${msgType} mediaId=${mediaId} size=${buffer.length} maxBytes=${mediaMaxBytes} ` +
+                    `contentType=${contentType} normalizedContentType=${normalizedContentType} originalFileName=${originalFileName} ` +
+                    `xmlFileName=${xmlFileName ?? "N/A"} headerFileName=${headerFileName ?? "N/A"} ` +
+                    `textHeuristic(sample=${heuristic.sampleSize}, bad=${heuristic.badCount}, ratio=${heuristic.badRatio.toFixed(4)}) ` +
+                    `headHex="${previewHex(buffer)}"`,
+                );
 
                 // 使用 Core SDK 保存媒体文件
                 const saved = await core.channel.media.saveMediaBuffer(
                     buffer,
-                    contentType,
+                    normalizedContentType,
                     "inbound", // context/scope
-                    LIMITS.MAX_REQUEST_BODY_SIZE, // limit
-                    filename
+                    mediaMaxBytes, // limit
+                    originalFileName
                 );
 
                 log?.(`[wecom-agent] media saved to: ${saved.path}`);
                 mediaPath = saved.path;
-                mediaType = contentType;
+                mediaType = normalizedContentType;
 
                 // 构建附件
                 attachments.push({
-                    name: filename,
-                    mimeType: contentType,
+                    name: originalFileName,
+                    mimeType: normalizedContentType,
                     url: pathToFileURL(saved.path).href, // 使用跨平台安全的文件 URL
                 });
 
                 // 更新文本提示
-                finalContent = `${content} (已下载 ${buffer.length} 字节)`;
+                if (textPreview) {
+                    finalContent = [
+                        content,
+                        "",
+                        "文件内容预览：",
+                        "```",
+                        textPreview,
+                        "```",
+                        `(已下载 ${buffer.length} 字节)`,
+                    ].join("\n");
+                } else {
+                    if (msgType === "file") {
+                        finalContent = [
+                            content,
+                            "",
+                            `已收到文件：${originalFileName}`,
+                            `文件类型：${normalizedContentType || contentType || "未知"}`,
+                            "提示：当前仅对文本/Markdown/JSON/CSV/HTML/PDF（可选）做内容抽取；其他二进制格式请转为 PDF 或复制文本内容。",
+                            `(已下载 ${buffer.length} 字节)`,
+                        ].join("\n");
+                    } else {
+                        finalContent = `${content} (已下载 ${buffer.length} 字节)`;
+                    }
+                }
+                log?.(`[wecom-agent] file preview: enabled=${looksText} finalContentLen=${finalContent.length} attachments=${attachments.length}`);
             } catch (err) {
-                error?.(`[wecom-agent] media download failed: ${String(err)}`);
-                finalContent = `${content} (媒体下载失败)`;
+                error?.(`[wecom-agent] media processing failed: ${String(err)}`);
+                finalContent = [
+                    content,
+                    "",
+                    `媒体处理失败：${String(err)}`,
+                    `提示：可在 OpenClaw 配置中提高 channels.wecom.media.maxBytes（当前=${mediaMaxBytes}）`,
+                    `例如：openclaw config set channels.wecom.media.maxBytes ${50 * 1024 * 1024}`,
+                ].join("\n");
             }
         } else {
-            error?.(`[wecom-agent] mediaId not found for ${msgType}`);
+            const keys = Object.keys((msg as unknown as Record<string, unknown>) ?? {}).slice(0, 50).join(",");
+            error?.(`[wecom-agent] mediaId not found for ${msgType}; keys=${keys}`);
         }
     }
 
@@ -316,6 +460,28 @@ async function processAgentMessage(params: {
         body: finalContent,
     });
 
+    const authz = await resolveWecomCommandAuthorization({
+        core,
+        cfg: config,
+        // Agent 门禁应读取 channels.wecom.agent.dm（即 agent.config.dm），而不是 channels.wecom.dm（不存在）
+        accountConfig: agent.config as any,
+        rawBody: finalContent,
+        senderUserId: fromUser,
+    });
+    log?.(`[wecom-agent] authz: dmPolicy=${authz.dmPolicy} shouldCompute=${authz.shouldComputeAuth} sender=${fromUser.toLowerCase()} senderAllowed=${authz.senderAllowed} authorizerConfigured=${authz.authorizerConfigured} commandAuthorized=${String(authz.commandAuthorized)}`);
+
+    // 命令门禁：未授权时必须明确回复（Agent 侧用私信提示）
+    if (authz.shouldComputeAuth && authz.commandAuthorized !== true) {
+        const prompt = buildWecomUnauthorizedCommandPrompt({ senderUserId: fromUser, dmPolicy: authz.dmPolicy, scope: "agent" });
+        try {
+            await sendText({ agent, toUser: fromUser, chatId: undefined, text: prompt });
+            log?.(`[wecom-agent] unauthorized command: replied via DM to ${fromUser}`);
+        } catch (err: unknown) {
+            error?.(`[wecom-agent] unauthorized command reply failed: ${String(err)}`);
+        }
+        return;
+    }
+
     const ctxPayload = core.channel.reply.finalizeInboundContext({
         Body: body,
         RawBody: finalContent,
@@ -332,8 +498,11 @@ async function processAgentMessage(params: {
         Provider: "wecom",
         Surface: "wecom",
         OriginatingChannel: "wecom",
-        OriginatingTo: `wecom:${peerId}`,
-        CommandAuthorized: true, // 已通过 WeCom 签名验证
+        // 标记为 Agent 会话的回复路由目标，避免与 Bot 会话混淆：
+        // - 用于让 /new /reset 这类命令回执不被 Bot 侧策略拦截
+        // - 群聊场景也统一路由为私信触发者（与 deliver 策略一致）
+        OriginatingTo: `wecom-agent:${fromUser}`,
+        CommandAuthorized: authz.commandAuthorized ?? true,
         MediaPath: mediaPath,
         MediaType: mediaType,
         MediaUrl: mediaPath,
@@ -359,12 +528,8 @@ async function processAgentMessage(params: {
                 if (!text) return;
 
                 try {
-                    await sendText({
-                        agent,
-                        toUser: fromUser,
-                        chatId: isGroup ? chatId : undefined,
-                        text,
-                    });
+                    // 统一策略：Agent 模式在群聊场景默认只私信触发者（避免 wr/wc chatId 86008）
+                    await sendText({ agent, toUser: fromUser, chatId: undefined, text });
                     log?.(`[wecom-agent] reply delivered (${info.kind}) to ${fromUser}`);
                 } catch (err: unknown) {
                     error?.(`[wecom-agent] reply failed: ${String(err)}`);

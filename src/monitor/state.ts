@@ -21,6 +21,9 @@ export class StreamStore {
     private streams = new Map<string, StreamState>();
     private msgidToStreamId = new Map<string, string>();
     private pendingInbounds = new Map<string, PendingInbound>();
+    private conversationState = new Map<string, { activeBatchKey: string; queue: string[]; nextSeq: number }>();
+    private streamIdToBatchKey = new Map<string, string>();
+    private batchStreamIdToAckStreamIds = new Map<string, string[]>();
     private onFlush?: (pending: PendingInbound) => void;
 
     /**
@@ -40,7 +43,7 @@ export class StreamStore {
      * @param params.msgid (可选) 企业微信消息 ID，用于后续去重映射
      * @returns 生成的 streamId (Hex 字符串)
      */
-    createStream(params: { msgid?: string }): string {
+    createStream(params: { msgid?: string; conversationKey?: string; batchKey?: string }): string {
         const streamId = crypto.randomBytes(16).toString("hex");
 
         if (params.msgid) {
@@ -50,12 +53,18 @@ export class StreamStore {
         this.streams.set(streamId, {
             streamId,
             msgid: params.msgid,
+            conversationKey: params.conversationKey,
+            batchKey: params.batchKey,
             createdAt: Date.now(),
             updatedAt: Date.now(),
             started: false,
             finished: false,
             content: ""
         });
+
+        if (params.batchKey) {
+            this.streamIdToBatchKey.set(streamId, params.batchKey);
+        }
 
         return streamId;
     }
@@ -78,6 +87,37 @@ export class StreamStore {
      */
     getStreamByMsgId(msgid: string): string | undefined {
         return this.msgidToStreamId.get(String(msgid));
+    }
+
+    setStreamIdForMsgId(msgid: string, streamId: string): void {
+        const key = String(msgid).trim();
+        const value = String(streamId).trim();
+        if (!key || !value) return;
+        this.msgidToStreamId.set(key, value);
+    }
+
+    /**
+     * 将“回执流”(ack stream) 关联到某个“批次流”(batch stream)。
+     * 用于：当用户连发多条消息被合并排队时，让后续消息的 stream 最终也能更新为可理解的提示，而不是永久停留在“已合并排队…”。
+     */
+    addAckStreamForBatch(params: { batchStreamId: string; ackStreamId: string }): void {
+        const batchStreamId = params.batchStreamId.trim();
+        const ackStreamId = params.ackStreamId.trim();
+        if (!batchStreamId || !ackStreamId) return;
+        const list = this.batchStreamIdToAckStreamIds.get(batchStreamId) ?? [];
+        list.push(ackStreamId);
+        this.batchStreamIdToAckStreamIds.set(batchStreamId, list);
+    }
+
+    /**
+     * 取出并清空某个批次流关联的所有回执流。
+     */
+    drainAckStreamsForBatch(batchStreamId: string): string[] {
+        const key = batchStreamId.trim();
+        if (!key) return [];
+        const list = this.batchStreamIdToAckStreamIds.get(key) ?? [];
+        this.batchStreamIdToAckStreamIds.delete(key);
+        return list;
     }
 
     /**
@@ -123,35 +163,94 @@ export class StreamStore {
      * @returns { streamId, isNew } isNew=true 表示这是新的一组消息，需初始化 ActiveReply
      */
     addPendingMessage(params: {
-        pendingKey: string;
+        conversationKey: string;
         target: WecomWebhookTarget;
         msg: WecomInboundMessage;
         msgContent: string;
         nonce: string;
         timestamp: string;
         debounceMs?: number;
-    }): { streamId: string; isNew: boolean } {
-        const { pendingKey, target, msg, msgContent, nonce, timestamp, debounceMs } = params;
+    }): { streamId: string; status: "active_new" | "active_merged" | "queued_new" | "queued_merged" } {
+        const { conversationKey, target, msg, msgContent, nonce, timestamp, debounceMs } = params;
         const effectiveDebounceMs = debounceMs ?? LIMITS.DEFAULT_DEBOUNCE_MS;
-        const existing = this.pendingInbounds.get(pendingKey);
 
-        if (existing) {
-            existing.contents.push(msgContent);
-            if (msg.msgid) existing.msgids.push(msg.msgid);
-            if (existing.timeout) clearTimeout(existing.timeout);
-
-            // 重置定时器 (Debounce)
-            existing.timeout = setTimeout(() => {
-                this.flushPending(pendingKey);
-            }, effectiveDebounceMs);
-
-            return { streamId: existing.streamId, isNew: false };
+        const state = this.conversationState.get(conversationKey);
+        if (!state) {
+            // 第一批次（active）
+            const batchKey = conversationKey;
+            const streamId = this.createStream({ msgid: msg.msgid, conversationKey, batchKey });
+            const pending: PendingInbound = {
+                streamId,
+                conversationKey,
+                batchKey,
+                target,
+                msg,
+                contents: [msgContent],
+                msgids: msg.msgid ? [msg.msgid] : [],
+                nonce,
+                timestamp,
+                createdAt: Date.now(),
+                timeout: setTimeout(() => {
+                    this.requestFlush(batchKey);
+                }, effectiveDebounceMs)
+            };
+            this.pendingInbounds.set(batchKey, pending);
+            this.conversationState.set(conversationKey, { activeBatchKey: batchKey, queue: [], nextSeq: 1 });
+            return { streamId, status: "active_new" };
         }
 
-        // 创建新的聚合分组
-        const streamId = this.createStream({ msgid: msg.msgid });
+        // 合并规则（排队语义）：
+        // - 初始批次（batchKey===conversationKey）不接收合并：避免 1/2 都刷出同一份最终答案。
+        // - 如果 active 批次是“排队批次”（batchKey!=conversationKey）且还没开始处理（started=false），
+        //   则允许把后续消息合并进该 active 批次（典型：1 很快结束，2 变 active 但还没开始跑，3 合并到 2）。
+        const activeBatchKey = state.activeBatchKey;
+        const activeIsInitial = activeBatchKey === conversationKey;
+        const activePending = this.pendingInbounds.get(activeBatchKey);
+        if (activePending && !activeIsInitial) {
+            const activeStream = this.streams.get(activePending.streamId);
+            const activeStarted = Boolean(activeStream?.started);
+            if (!activeStarted) {
+                activePending.contents.push(msgContent);
+                if (msg.msgid) {
+                    activePending.msgids.push(msg.msgid);
+                    // 注意：不把该 msgid 映射到 active streamId（避免该消息最终也刷出同一份完整答案）
+                }
+                if (activePending.timeout) clearTimeout(activePending.timeout);
+                activePending.timeout = setTimeout(() => {
+                    this.requestFlush(activeBatchKey);
+                }, effectiveDebounceMs);
+                return { streamId: activePending.streamId, status: "active_merged" };
+            }
+        }
+
+        // active 批次已经开始处理；后续消息进入队列批次（queued），并允许在队列批次内做防抖聚合。
+        const queuedBatchKey = state.queue[0];
+        if (queuedBatchKey) {
+            const existingQueued = this.pendingInbounds.get(queuedBatchKey);
+            if (existingQueued) {
+                existingQueued.contents.push(msgContent);
+                if (msg.msgid) {
+                    existingQueued.msgids.push(msg.msgid);
+                    // 注意：不把该 msgid 映射到 queued streamId（避免该消息最终也刷出同一份完整答案）
+                }
+                if (existingQueued.timeout) clearTimeout(existingQueued.timeout);
+
+                existingQueued.timeout = setTimeout(() => {
+                    this.requestFlush(queuedBatchKey);
+                }, effectiveDebounceMs);
+                return { streamId: existingQueued.streamId, status: "queued_merged" };
+            }
+        }
+
+        // 创建新的 queued 批次（会话只保留 1 个“下一批次”，后续消息继续合并到该批次）
+        const seq = state.nextSeq++;
+        const batchKey = `${conversationKey}#q${seq}`;
+        state.queue = [batchKey];
+        const streamId = this.createStream({ msgid: msg.msgid, conversationKey, batchKey });
         const pending: PendingInbound = {
             streamId,
+            conversationKey,
+            batchKey,
             target,
             msg,
             contents: [msgContent],
@@ -160,11 +259,32 @@ export class StreamStore {
             timestamp,
             createdAt: Date.now(),
             timeout: setTimeout(() => {
-                this.flushPending(pendingKey);
+                this.requestFlush(batchKey);
             }, effectiveDebounceMs)
         };
-        this.pendingInbounds.set(pendingKey, pending);
-        return { streamId, isNew: true };
+        this.pendingInbounds.set(batchKey, pending);
+        this.conversationState.set(conversationKey, state);
+        return { streamId, status: "queued_new" };
+    }
+
+    /**
+     * 请求刷新：如果该批次当前为 active，则立即 flush；否则标记 ready，等待前序批次完成后再 flush。
+     */
+    private requestFlush(batchKey: string): void {
+        const pending = this.pendingInbounds.get(batchKey);
+        if (!pending) return;
+
+        const state = this.conversationState.get(pending.conversationKey);
+        const isActive = state?.activeBatchKey === batchKey;
+        if (!isActive) {
+            if (pending.timeout) {
+                clearTimeout(pending.timeout);
+                pending.timeout = null;
+            }
+            pending.readyToFlush = true;
+            return;
+        }
+        this.flushPending(batchKey);
     }
 
     /**
@@ -181,10 +301,41 @@ export class StreamStore {
             clearTimeout(pending.timeout);
             pending.timeout = null;
         }
+        pending.readyToFlush = false;
 
         if (this.onFlush) {
             this.onFlush(pending);
         }
+    }
+
+    /**
+     * 在一个 stream 完成后推进会话队列：将 queued 批次提升为 active，并在需要时触发 flush。
+     */
+    onStreamFinished(streamId: string): void {
+        const batchKey = this.streamIdToBatchKey.get(streamId);
+        const state = batchKey ? this.streams.get(streamId) : undefined;
+        const conversationKey = state?.conversationKey;
+        if (!batchKey || !conversationKey) return;
+
+        const conv = this.conversationState.get(conversationKey);
+        if (!conv) return;
+        if (conv.activeBatchKey !== batchKey) return;
+
+        const next = conv.queue.shift();
+        if (!next) {
+            // 队列为空：会话已空闲。删除状态，避免后续消息被误判为“排队但永远不触发”。
+            this.conversationState.delete(conversationKey);
+            return;
+        }
+        conv.activeBatchKey = next;
+        this.conversationState.set(conversationKey, conv);
+
+        const pending = this.pendingInbounds.get(next);
+        if (!pending) return;
+        if (pending.readyToFlush) {
+            this.flushPending(next);
+        }
+        // 否则等待该批次自己的 debounce timer 到期后 requestFlush(next) 执行
     }
 
     /**
@@ -221,6 +372,15 @@ export class StreamStore {
             if (now - pending.createdAt > LIMITS.STREAM_TTL_MS) {
                 if (pending.timeout) clearTimeout(pending.timeout);
                 this.pendingInbounds.delete(key);
+            }
+        }
+
+        // 清理 conversationState：active 已不存在且队列为空的会话
+        for (const [convKey, conv] of this.conversationState.entries()) {
+            const activeExists = this.pendingInbounds.has(conv.activeBatchKey) || Array.from(this.streamIdToBatchKey.values()).includes(conv.activeBatchKey);
+            const hasQueue = conv.queue.length > 0;
+            if (!activeExists && !hasQueue) {
+                this.conversationState.delete(convKey);
             }
         }
     }
