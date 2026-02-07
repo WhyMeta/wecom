@@ -29,22 +29,24 @@ The plugin implements a unique dual-mode architecture:
 index.ts              # Plugin entry - registers channel and HTTP handlers
 src/
   channel.ts          # ChannelPlugin implementation, lifecycle management
-  monitor.ts          # Core webhook handler, message flow, stream state
+  monitor.ts          # Core webhook handler (~1800 lines). Orchestrates message
+                      # flow, stream state, queuing, and mode switching (Bot↔Agent)
   runtime.ts          # Runtime state singleton
   http.ts             # HTTP client with undici + proxy support
   crypto.ts           # AES-CBC encryption/decryption for webhooks
   media.ts            # Media file download/decryption
-  outbound.ts         # Outbound message adapter
-  target.ts           # Target resolution (user/party/tag/chat)
+  outbound.ts         # Outbound message adapter (OpenClaw → WeCom format)
+  target.ts           # Target resolution (user/party/tag/chat) for broadcasts
   dynamic-agent.ts    # Dynamic agent routing (per-user/per-group isolation)
+  onboarding.ts       # User onboarding flow (/new, /reset command handling)
   agent/
     api-client.ts     # WeCom API client with AccessToken caching
     handler.ts        # XML webhook handler for Agent mode
   config/
-    schema.ts         # Zod schemas for configuration
+    schema.ts         # Zod schemas for configuration validation
   monitor/
     state.ts          # StreamStore and ActiveReplyStore with TTL pruning
-  types/constants.ts  # API endpoints and limits
+  types/              # TypeScript type definitions
 ```
 
 ### Stream State Management
@@ -67,20 +69,20 @@ Agent mode uses automatic AccessToken caching (`src/agent/api-client.ts`):
 
 ### Testing
 
-This project uses **Vitest**. Tests extend from a base config at `../../vitest.config.ts`:
+This project uses **Vitest**. Tests extend from a base config at `../../vitest.config.ts` and must be run from the project root with the correct working directory:
 
 ```bash
 # Run all tests
-npx vitest --config vitest.config.ts
+npx vitest --config extensions/wecom/vitest.config.ts --root extensions/wecom
 
 # Run specific test file
-npx vitest --config vitest.config.ts src/crypto.test.ts
+npx vitest --config extensions/wecom/vitest.config.ts --root extensions/wecom src/crypto.test.ts
 
 # Run tests matching pattern
-npx vitest --config vitest.config.ts --testNamePattern="should encrypt"
+npx vitest --config extensions/wecom/vitest.config.ts --root extensions/wecom --testNamePattern="should encrypt"
 
 # Watch mode
-npx vitest --config vitest.config.ts --watch
+npx vitest --config extensions/wecom/vitest.config.ts --root extensions/wecom --watch
 ```
 
 Test files are located alongside source files with `.test.ts` suffix:
@@ -94,6 +96,10 @@ Test files are located alongside source files with `.test.ts` suffix:
 ```bash
 npx tsc --noEmit
 ```
+
+### Linting/Formatting
+
+This project does not use ESLint or Prettier. Code style is maintained through TypeScript strict mode and manual review.
 
 ### Build
 
@@ -151,10 +157,10 @@ openclaw config set channels.wecom.dynamicAgents.adminUsers '["admin1","admin2"]
 ```
 
 **Generated Agent ID format**: `wecom-{type}-{peerId}`
-- DM: `wecom-dm-zhangsan`
-- Group: `wecom-group-wr123456`
+- DM: `wecom-dm-{userid}` - Private conversations
+- Group: `wecom-group-{chatid}` - Group conversations (e.g., `wecom-group-wr123456`)
 
-Dynamic agents are automatically added to `agents.list` in the config file.
+Dynamic agents are automatically registered to `agents.list` in the config file asynchronously. The main agent credentials are inherited unless overridden.
 
 ## Key Technical Details
 
@@ -192,6 +198,7 @@ openclaw config set channels.wecom.network.egressProxyUrl "http://proxy.company.
 - Integration tests mock WeCom API responses
 - Crypto tests verify AES encryption round-trips
 - Monitor tests cover stream state transitions and queue behavior
+- Message deduplication tests verify `msgid`-based duplicate prevention for both Bot and Agent modes
 
 ## Common Patterns
 
