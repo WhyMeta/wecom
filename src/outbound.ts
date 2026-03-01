@@ -31,6 +31,7 @@ export const wecomOutbound: ChannelOutboundAdapter = {
   },
   sendText: async ({ cfg, to, text }: ChannelOutboundContext) => {
     // signal removed - not supported in current SDK
+    console.log(`[wecom-outbound-debug] sendText called, to=${to}, textLen=${text?.length}`);
 
     const agent = resolveAgentConfigOrThrow(cfg);
     const result = resolveWecomTarget(to);
